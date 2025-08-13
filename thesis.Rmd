@@ -1,0 +1,929 @@
+---
+title: "Thesis"
+output: pdf_document
+date: "2025-08-13"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+library(svs)
+library(readr)
+library(dplyr)
+library(data.table)
+library(cluster)
+library(ggplot2)
+library(vegan)
+library(Rdimtools)
+library(tidyverse)
+library(reshape2) 
+library(RcppML)
+library(pheatmap)
+library(gridExtra)
+library(grid)
+library(FactoMineR)
+library(proxy)
+library(ggrepel)
+```
+
+## Load Data
+
+```{r}
+data <- read_csv2("data_Ngr.csv")
+data$lang4 <- as.factor(data$lang4)
+subset_data <- select(data, fileID, nN_GRM)
+lang4_map <- unique(select(data, fileID, lang4)) 
+levels_l4 <- levels(data$lang4)
+freq_table <- table(subset_data)
+```
+## Helper functions
+
+```{r, echo = FALSE}
+
+compute_distance_matrix <- function(df) {
+  # Identify Dim columns
+  dim_cols <- grep("^Dim", colnames(df), value = TRUE)
+  
+  if (length(dim_cols) < 1 || !"lang4" %in% colnames(df)) {
+    stop("Data frame must contain 'lang4' and at least one 'DimX' column.")
+  }
+  
+  # Compute group centers
+  group_centers <- aggregate(. ~ lang4, data = df[, c("lang4", dim_cols)],
+                             FUN = mean)
+  rownames(group_centers) <- group_centers$lang4
+  
+  # Remove group label column for distance calculation
+  coords <- group_centers[, dim_cols]
+  
+  # Compute pairwise Manhattan distances between centers
+  dist_matrix <- as.matrix(dist(coords, method = "manhattan"))
+  
+  return(dist_matrix)
+}
+
+compute_group_heterogeneity <- function(df) {
+  # Identify dimension columns automatically
+  dim_cols <- grep("^Dim", colnames(df), value = TRUE)
+  
+  if (length(dim_cols) < 1 || !"lang4" %in% colnames(df)) {
+    stop("Data frame must contain 'lang4' and at least one 'DimX' column.")
+  }
+  
+  # Helper function to compute Manhattan heterogeneity
+  compute_heterogeneity <- function(sub_df) {
+    center <- colMeans(sub_df[, dim_cols, drop = FALSE])
+    diffs <- abs(sweep(sub_df[, dim_cols, drop = FALSE], 2, center))
+    squared_manhattan <- rowSums(diffs)
+    mean(squared_manhattan)
+  }
+  
+  # Unique groups
+  groups <- unique(df$lang4)
+  
+  # Compute total heterogeneity across all data
+  total_heterogeneity <- compute_heterogeneity(df)
+  
+  # Initialize results data frame
+  results <- data.frame(
+    lang4 = character(),
+    heterogeneity = numeric(),
+    total_heterogeneity = numeric(),
+    heterogeneity_ratio = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Compute heterogeneity per group
+  for (g in groups) {
+    group_data <- df[df$lang4 == g, ]
+    point_estimate <- compute_heterogeneity(group_data)
+    
+    results <- rbind(results, data.frame(
+      lang4 = g,
+      heterogeneity_ratio = point_estimate / total_heterogeneity
+    ))
+  }
+  
+  return(results[order(results$lang4), ])
+}
+
+
+plot_group_centroids <- function(df, xlim_vals = NULL, ylim_vals = NULL) {
+  # Identify dimension columns
+  dim_cols <- grep("^Dim", colnames(df), value = TRUE)
+  if (length(dim_cols) < 2 || !"lang4" %in% colnames(df)) {
+    stop("Input df must include at least Dim1, Dim2, and lang4.")
+  }
+
+  # Select only needed columns
+  df <- df[, c("lang4", dim_cols)]
+
+  # Rename dimensions to V1 and V2 for plotting
+  df <- df %>%
+    rename(V1 = !!dim_cols[1], V2 = !!dim_cols[2])
+
+  # Compute group centroids
+  centroids <- df %>%
+    group_by(lang4) %>%
+    summarise(Dim1 = mean(V1), Dim2 = mean(V2), .groups = "drop")
+
+  rownames(centroids) <- centroids$lang4
+
+  # Create base plot
+  p <- ggplot() +
+    geom_point(data = df, aes(x = V1, y = V2), 
+               color = "grey", size = 3) +
+    
+    geom_point(data = centroids, aes(x = Dim1, y = Dim2), 
+               color = "red", size = 3) +
+    
+    geom_text_repel(data = centroids, 
+                    aes(x = Dim1, y = Dim2, label = lang4), 
+                    size = 5, max.overlaps = 50) +
+    
+    labs(x = "Dimension 1", y = "Dimension 2") +
+    
+    theme_minimal() +
+    theme(
+      panel.border = element_rect(color = "black", fill = NA, size = 1),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.title.x = element_text(size = rel(2.25)),
+      axis.title.y = element_text(size = rel(2.25)),
+      axis.text.x = element_text(size = rel(1.75)),
+      axis.text.y = element_text(size = rel(1.75))
+    )
+
+  # Conditionally apply axis limits
+  if (!is.null(xlim_vals)) {
+    p <- p + xlim(xlim_vals)
+  }
+  if (!is.null(ylim_vals)) {
+    p <- p + ylim(ylim_vals)
+  }
+
+  return(p)
+}
+
+get_correlation_plot <- function(df_list) {
+  
+  DM_mat <- do.call(cbind, df_list)
+  
+  cor_pearson  <- cor(DM_mat, method = "pearson")
+  cor_spearman <- cor(DM_mat, method = "spearman")
+  cor_kendall  <- cor(DM_mat, method = "kendall")
+  
+  # Step 2: Function to mask lower triangle + diagonal
+  mask_upper <- function(mat) {
+    mat_masked <- mat
+    diag(mat_masked) <- NA
+    mat_masked[lower.tri(mat_masked)] <- NA
+    return(mat_masked)
+  }
+  
+  get_number_matrix <- function(cor_matrix) {
+    num_matrix <- matrix("", nrow = nrow(cor_matrix), ncol = ncol(cor_matrix))
+    formatted_vals <- formatC(cor_matrix, format = "f", digits = 2)
+    num_matrix[upper.tri(cor_matrix)] <- formatted_vals[upper.tri(cor_matrix)]
+    rownames(num_matrix) <- rownames(cor_matrix)
+    colnames(num_matrix) <- colnames(cor_matrix)
+    return(num_matrix)
+  }
+  
+  cor_pearson_masked  <- mask_upper(cor_pearson)
+  cor_spearman_masked <- mask_upper(cor_spearman)
+  cor_kendall_masked  <- mask_upper(cor_kendall)
+  
+  # Step 3: Set color scale limits
+  min_val <- -1
+  max_val <- 1
+  
+  # Step 4: Plot heatmaps
+  heatmap_pearson <- pheatmap(cor_pearson_masked, 
+                              main = "Pearson Correlations",
+                              cluster_rows = FALSE, cluster_cols = FALSE,
+                              na_col = "grey",
+                              breaks = seq(min_val, max_val, length.out = 100),
+                              legend = TRUE,
+                              silent = TRUE,
+                              display_numbers = get_number_matrix(cor_pearson))
+  
+  heatmap_spearman <- pheatmap(cor_spearman_masked, 
+                               main = "Spearman Correlations",
+                               cluster_rows = FALSE, cluster_cols = FALSE,
+                               na_col = "grey",
+                               breaks = seq(min_val, max_val, length.out = 100),
+                               legend = TRUE,
+                               silent = TRUE,
+                              display_numbers = get_number_matrix(cor_spearman))
+  
+  heatmap_kendall <- pheatmap(cor_kendall_masked, 
+                              main = "Kendall Correlations",
+                              cluster_rows = FALSE, cluster_cols = FALSE,
+                              na_col = "grey",
+                              breaks = seq(min_val, max_val, length.out = 100),
+                              legend = TRUE,
+                              silent = TRUE,
+                              display_numbers = get_number_matrix(cor_kendall))
+
+  print(cor_pearson)
+  print(cor_spearman)
+  print(cor_kendall)
+  
+  # Step 5: Arrange all three heatmaps side-by-side
+  grid.arrange(grobs = list(heatmap_pearson[[4]], 
+                            heatmap_spearman[[4]], 
+                            heatmap_kendall[[4]]), 
+               ncol = 3)
+}
+
+# This function was not used, see Methodology as to why
+compute_bootstrap_correlation_ci <- function(mapping_list,
+                                          n_bootstrap = 1000,
+                                          ci_level = 0.95,
+                                          metric = c("distance", "heterogeneity")) {
+
+  metric <- match.arg(metric)
+  cor_methods <- c("pearson", "spearman", "kendall")
+  group_col <- "lang4"
+
+  # Helper: Extract upper triangle as vector
+  get_upper_triangle <- function(mat) {
+    stopifnot(nrow(mat) == ncol(mat))
+    return(mat[upper.tri(mat)])
+  }
+
+  # Extract fileIDs and groups
+  first_map <- mapping_list[[1]]
+  file_ids <- first_map$fileID
+  groups <- first_map[[group_col]]
+  group_table <- table(groups)
+
+  cor_results <- list()
+
+  for (cor_method in cor_methods) {
+    cor_matrix <- matrix(NA, nrow = length(mapping_list),
+                         ncol = length(mapping_list))
+    ci_lower_matrix <- cor_matrix
+    ci_upper_matrix <- cor_matrix
+    rownames(cor_matrix) <- colnames(cor_matrix) <- names(mapping_list)
+
+    for (i in seq_along(mapping_list)) {
+      for (j in seq_along(mapping_list)) {
+        if (j < i) next  # only upper triangle (including diagonal)
+
+        # Compute correlation on original data (no bootstrap)
+        if (metric == "distance") {
+          d1_orig <- get_upper_triangle(compute_distance_matrix(mapping_list[[i]]))
+          d2_orig <- get_upper_triangle(compute_distance_matrix(mapping_list[[j]]))
+        } else {
+          d1_orig <- compute_group_heterogeneity(mapping_list[[i]])$heterogeneity_ratio
+          d2_orig <- compute_group_heterogeneity(mapping_list[[j]])$heterogeneity_ratio
+        }
+        valid_idx_orig <- which(!is.na(d1_orig) & !is.na(d2_orig))
+        if (length(valid_idx_orig) > 2) {
+          cor_matrix[i, j] <- suppressWarnings(cor(d1_orig[valid_idx_orig],
+                                                   d2_orig[valid_idx_orig],
+                                                   method = cor_method))
+        } else {
+          cor_matrix[i, j] <- NA
+        }
+
+        # Bootstrap correlations
+        cor_vals <- numeric(n_bootstrap)
+        for (b in 1:n_bootstrap) {
+          # Bootstrap indices within groups
+          boot_indices <- unlist(lapply(names(group_table), function(g) {
+            idx <- which(groups == g)
+            sample(idx, length(idx), replace = TRUE)
+          }))
+
+          # Apply bootstrap to both mappings
+          map1 <- mapping_list[[i]][boot_indices, ]
+          map2 <- mapping_list[[j]][boot_indices, ]
+
+          # Extract distance or heterogeneity values
+          if (metric == "distance") {
+            d1 <- get_upper_triangle(compute_distance_matrix(map1))
+            d2 <- get_upper_triangle(compute_distance_matrix(map2))
+          } else {
+            d1 <- compute_group_heterogeneity(map1)$heterogeneity_ratio
+            d2 <- compute_group_heterogeneity(map2)$heterogeneity_ratio
+          }
+
+          # Ensure complete pairs
+          valid_idx <- which(!is.na(d1) & !is.na(d2))
+          if (length(valid_idx) > 2) {
+            cor_vals[b] <- suppressWarnings(cor(d1[valid_idx], d2[valid_idx],
+                                                method = cor_method))
+          } else {
+            cor_vals[b] <- NA
+          }
+        }
+
+        # Compute confidence intervals
+        ci <- quantile(cor_vals,
+                       probs = c((1 - ci_level) / 2, 1 - (1 - ci_level) / 2),
+                       na.rm = TRUE)
+        ci_lower_matrix[i, j] <- ci[1]
+        ci_upper_matrix[i, j] <- ci[2]
+      }
+    }
+
+    cor_results[[cor_method]] <- list(
+      cor = cor_matrix,
+      ci_lower = ci_lower_matrix,
+      ci_upper = ci_upper_matrix
+    )
+  }
+
+  return(cor_results)
+}
+
+plot_cor_CI <- function(cor_results) {
+  cor_methods <- names(cor_results)
+  # Plotting
+  for (cor_method in cor_methods) {
+    cor_mat <- t(cor_results[[cor_method]]$cor)
+    lower_mat <- t(cor_results[[cor_method]]$ci_lower)
+    upper_mat <- t(cor_results[[cor_method]]$ci_upper)
+
+    # Melt matrices and combine
+    df <- melt(cor_mat, varnames = c("Map1", "Map2"),
+               value.name = "Correlation")
+    df$Lower <- melt(lower_mat)$value
+    df$Upper <- melt(upper_mat)$value
+
+    # Identify upper triangle and diagonal
+    df$is_diag <- as.character(df$Map1) == as.character(df$Map2)
+    df$map_i <- match(df$Map1, rownames(cor_mat))
+    df$map_j <- match(df$Map2, colnames(cor_mat))
+    df$is_upper <- df$map_i > df$map_j
+
+    # Labels only on upper triangle (excluding diag and NA)
+    df$label <- ifelse(df$is_upper & !is.na(df$Correlation),
+                       sprintf("%.2f\n[%.2f, %.2f]", df$Correlation, df$Lower,
+                               df$Upper),
+                       "")
+
+    # Tile fill logic: grey out diagonal, use NA for lower
+    df$fill_val <- ifelse(df$is_diag, NA, df$Correlation)
+
+    p <- ggplot(df, aes(Map1, Map2)) +
+      geom_tile(data = df, aes(fill = fill_val), color = "white") +
+      scale_fill_gradient2(
+        low = "blue", mid = "white", high = "red",
+        midpoint = 0, limit = c(-1, 1), na.value = "grey80",
+        name = ""
+      ) +
+      scale_y_discrete(limits = rev) +  # ⬅️ Invert X-axis
+      geom_text(aes(label = label), size = 3) +
+      theme_minimal() +
+      theme(
+        axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank()
+      )
+
+    print(p)
+  }
+}
+
+```
+
+## Data
+``` {r}
+# How many data points in each group?
+table(select(unique(select(data, fileID, lang4)), lang4))
+
+# Histogram of Counts
+x_min <- floor(min(freq_table))
+x_max <- ceiling(max(freq_table))
+breaks <- seq(x_min, x_max, by = 1)
+hist(freq_table,
+     breaks = breaks,
+     xaxt = "n",
+     col = "grey", 
+     border = "black",
+     main = "", 
+     xlab = "Count")
+axis(1, at = breaks)
+
+# Histogram of counts excluding 0
+freq_values <- as.numeric(freq_table)
+freq_values_no_zero <- freq_values[freq_values != 0]
+x_min <- floor(min(freq_values_no_zero))
+x_max <- ceiling(max(freq_values_no_zero))
+breaks <- seq(x_min, x_max, by = 1)
+hist(freq_values_no_zero, 
+     breaks = breaks, 
+     xaxt = "n", 
+     col = "grey", 
+     border = "black",
+     main = "",
+     xlab = "Count")
+axis(1, at = breaks)
+
+row_totals <- rowSums(freq_table)
+col_totals <- colSums(freq_table)
+
+bin_width <- 5
+breaks <- seq(min(row_totals), max(row_totals) + bin_width, by = bin_width)
+# Row totals histogram
+hist(row_totals,
+     breaks = breaks,
+     main = "",
+     xlab = "n-grams per speech",
+     ylab= "number of speeches",
+     col = "grey",
+     border = "white")
+
+bin_width <- 10
+breaks <- seq(min(col_totals), max(col_totals) + bin_width, by = bin_width)
+# Column totals histogram
+hist(col_totals,
+     breaks = breaks,
+     main = "",
+     xlab = "total n-gram count",
+     ylab= "number of n-grams",
+     col = "grey",
+     border = "white")
+
+
+# Align lang4 with freq_table rows
+fileIDs <- rownames(freq_table)
+lang4_vector <- lang4_map$lang4
+names(lang4_vector) <- lang4_map$fileID
+lang4_aligned <- lang4_vector[fileIDs]
+
+# Convert freq_table
+tot_mat <- freq_table
+colnames(tot_mat) <- paste0("Dim", seq_len(ncol(tot_mat)))
+tot_mat <- cbind(tot_mat, lang4 = lang4_aligned)
+tot_df <- as.data.frame(tot_mat)
+
+# --- Call the function and print results ---
+DATA_heterogeneity <- compute_group_heterogeneity(tot_df)
+DATA_distance <- compute_distance_matrix(tot_df)
+DATA_distance
+DATA_heterogeneity
+
+freq_df <- as.data.frame.matrix(freq_table) %>%
+  mutate(lang4 = as.character(lang4_aligned))
+
+# Step 1: Summarize by lang4
+summ_df <- freq_df %>%
+  group_by(lang4) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE)) %>%
+  mutate(lang4 = as.character(lang4))  # ensure character type
+
+# Step 2: Column totals
+col_totals <- colSums(summ_df[ , -1], na.rm = TRUE)
+
+# Step 3: Identify smallest 3 & largest 3 columns
+smallest_cols <- names(sort(col_totals))[1:3]
+largest_cols  <- names(sort(col_totals, decreasing = TRUE))[1:3]
+keep_cols <- unique(c(largest_cols, smallest_cols)) # avoid duplicates
+
+# Step 4: Collapse other columns into "Other"
+summ_df_reduced <- summ_df %>%
+  mutate(Other = rowSums(across(
+    .cols = setdiff(names(summ_df), c("lang4", keep_cols))
+  ), na.rm = TRUE)) %>%
+  select(lang4, all_of(keep_cols), Other)
+
+# Step 5: Add row totals
+summ_df_reduced <- summ_df_reduced %>%
+  mutate(RowTotal = rowSums(across(where(is.numeric))))
+
+# Step 6: Add column totals row
+final_df <- bind_rows(
+  summ_df_reduced,
+  summarise(
+    summ_df_reduced,
+    lang4 = "Total",
+    across(where(is.numeric), sum, na.rm = TRUE)
+  )
+)
+
+print(final_df)
+```
+t most 
+
+## DiCA
+
+``` {r}
+# Init DiCA
+list_group <- list()  
+
+for (x in seq_along(levels_l4)) {  
+  list_group[[x]] <- unique(data$fileID[data$lang4 == levels_l4[x]])  
+}
+names(list_group) <- levels_l4  
+
+# Run DiCA
+dca_results <- fast_dca(subset_data, clusters1=list_group, members = TRUE)
+
+# Put in standard format
+DICA_mapping <- data.frame(dca_results$mem1)[,c(1,2)]
+DICA_mapping$fileID <- rownames(DICA_mapping)
+DICA_mapping <-  merge(DICA_mapping, lang4_map, by = "fileID", all.x = TRUE)
+
+# Make plots, compute distance and heterogeneity
+DICA_distance <- compute_distance_matrix(DICA_mapping)
+DICA_heterogeneity <- compute_group_heterogeneity(DICA_mapping)
+plot_group_centroids(DICA_mapping)
+DICA_distance
+DICA_heterogeneity
+
+# Compute and plot inertia / explained variation
+inertia <- dca_results$val / sum(dca_results$val)
+par(pin = c(4, 2.9))           
+
+plot(inertia,
+     type = "b",
+     xaxt = "n",                   
+     xlab = "Principal Axes",
+     ylab = "Proportion of Inertia",,
+     pch = 19,
+     col = "blue",
+     xlim = c(1, 4))          
+axis(1, at = 1:4)
+
+explained_var <- inertia[1] + inertia[2]
+print(explained_var)
+```
+
+## MDS CHI-SQUARED
+
+```{r mds}
+MDS_CS_distance <- dist_chisq(freq_table)
+
+# Run Classical MDS
+MDS_CS_coords <- cmdscale(MDS_CS_distance, k = 2)
+
+# Put in standard format
+MDS_CS_mapping <- as.data.frame(MDS_CS_coords)
+MDS_CS_mapping$fileID <- rownames(MDS_CS_mapping)
+MDS_CS_mapping <- left_join(MDS_CS_mapping, unique(select(data, fileID, lang4)),
+                         by = "fileID")
+colnames(MDS_CS_mapping)[colnames(MDS_CS_mapping) 
+                      %in% c("V1", "V2")] <- c("Dim1", "Dim2")
+
+# Make plots, compute distance and heterogeneity
+MDS_CS_distance <- compute_distance_matrix(MDS_CS_mapping)
+MDS_CS_heterogeneity <- compute_group_heterogeneity(MDS_CS_mapping)
+plot_group_centroids(MDS_CS_mapping, xlim=c(-0.5,0.5), ylim=c(-0.5,0.5))
+MDS_CS_distance
+MDS_CS_heterogeneity
+```
+## MDS MANHATTAN
+
+```{r mds}
+MDS_M_distance <- dist(freq_table, method="manhattan")
+
+# Run Classical MDS
+MDS_M_coords <- cmdscale(MDS_M_distance, k = 2)
+
+# Put in standard format
+MDS_M_mapping <- as.data.frame(MDS_M_coords)
+MDS_M_mapping$fileID <- rownames(MDS_M_mapping)
+MDS_M_mapping <- left_join(MDS_M_mapping, unique(select(data, fileID, lang4)),
+                         by = "fileID")
+colnames(MDS_M_mapping)[colnames(MDS_M_mapping) 
+                      %in% c("V1", "V2")] <- c("Dim1", "Dim2")
+
+# Make plots, compute distance and heterogeneity
+MDS_M_distance <- compute_distance_matrix(MDS_M_mapping)
+MDS_M_heterogeneity <- compute_group_heterogeneity(MDS_M_mapping)
+plot_group_centroids(MDS_M_mapping, xlim=c(-5,5), ylim=c(-5,5))
+MDS_M_distance
+MDS_M_heterogeneity
+```
+
+## ISOMAP CHI-SQUARED
+
+```{r}
+# Compute distance matrix
+ISOMAP_CS_distance <- dist_chisq(freq_table)
+
+# Run Isomap
+ISOMAP_CS_coords <- isomap(ISOMAP_CS_distance, ndim = 2, k = 10)$points
+
+# Put in standard format
+ISOMAP_CS_mapping <- as.data.frame(ISOMAP_CS_coords)
+ISOMAP_CS_mapping$fileID <- rownames(ISOMAP_CS_mapping)
+ISOMAP_CS_mapping <- left_join(ISOMAP_CS_mapping, unique(select(data, fileID,
+                                                                lang4))
+                            , by = "fileID")
+colnames(ISOMAP_CS_mapping)[colnames(ISOMAP_CS_mapping) 
+                         %in% c("V1", "V2")] <- c("Dim1", "Dim2")
+
+# Make plots, compute distance and heterogeneity
+ISOMAP_CS_distance <- compute_distance_matrix(ISOMAP_CS_mapping)
+ISOMAP_CS_heterogeneity <- compute_group_heterogeneity(ISOMAP_CS_mapping)
+plot_group_centroids(ISOMAP_CS_mapping, xlim = c(-5, 5), ylim = c(-5, 5))
+ISOMAP_CS_distance
+ISOMAP_CS_heterogeneity
+```
+## ISOMAP MANHATTAN
+
+```{r}
+# Compute distance matrix
+ISOMAP_M_distance <- dist(freq_table, method="manhattan")
+
+# Run Isomap
+ISOMAP_M_coords <- isomap(ISOMAP_M_distance, ndim = 2, k = 10)$points
+
+# Put in standard format
+ISOMAP_M_mapping <- as.data.frame(ISOMAP_M_coords)
+ISOMAP_M_mapping$fileID <- rownames(ISOMAP_M_mapping)
+ISOMAP_M_mapping <- left_join(ISOMAP_M_mapping, unique(select(data, fileID,
+                                                              lang4))
+                            , by = "fileID")
+colnames(ISOMAP_M_mapping)[colnames(ISOMAP_M_mapping) 
+                         %in% c("V1", "V2")] <- c("Dim1", "Dim2")
+
+# Make plots, compute distance and heterogeneity
+ISOMAP_M_distance <- compute_distance_matrix(ISOMAP_M_mapping)
+ISOMAP_M_heterogeneity <- compute_group_heterogeneity(ISOMAP_M_mapping)
+plot_group_centroids(ISOMAP_M_mapping, xlim = c(-5, 5), ylim = c(-5, 5))
+ISOMAP_M_distance
+ISOMAP_M_heterogeneity
+```
+
+## LLE
+
+```{r}
+# Run Locally Linear Embedding (LLE)
+LLE_coords <- do.lle(
+  freq_table,
+  ndim = 2,
+  regparam = 2,
+  preprocess = "null"
+)$Y
+
+# Put in standard format
+LLE_mapping <- as.data.frame(LLE_coords)
+LLE_mapping$fileID <- rownames(MDS_CS_coords)
+LLE_mapping <- left_join(LLE_mapping, unique(select(data, fileID, lang4))
+                         , by = "fileID")
+colnames(LLE_mapping)[colnames(LLE_mapping) 
+                      %in% c("V1", "V2")] <- c("Dim1", "Dim2")
+
+# Make plots, compute distance and heterogeneity
+LLE_distance <- compute_distance_matrix(LLE_mapping)
+LLE_heterogeneity <- compute_group_heterogeneity(LLE_mapping)
+plot_group_centroids(LLE_mapping)
+LLE_distance
+LLE_heterogeneity
+```
+
+
+
+## NMF
+
+```{r}
+# Run Non-negative Matrix Factorization (NMF)
+NMF_coords <- nmf(freq_table, 2)
+
+# Put in standard format
+NMF_mapping <- as.data.frame(NMF_coords)
+NMF_mapping$fileID <- rownames(MDS_CS_coords)
+NMF_mapping <- left_join(NMF_mapping, unique(select(data, fileID, lang4))
+                         , by = "fileID")
+
+colnames(NMF_mapping)[colnames(NMF_mapping) 
+                      %in% c("w.1", "w.2")] <- c("Dim1", "Dim2")
+
+# Make plots, compute distance and heterogeneity
+NMF_distance <- compute_distance_matrix(NMF_mapping)
+NMF_heterogeneity <- compute_group_heterogeneity(NMF_mapping)
+plot_group_centroids(NMF_mapping)
+NMF_distance
+NMF_heterogeneity
+
+# Traditional NMF visualization
+centroids <- NMF_mapping %>%
+  group_by(lang4) %>%
+  summarise(Dim1 = mean(Dim1), Dim2 = mean(Dim2), .groups = 'drop')
+  centroids_long <- melt(centroids, id.vars = "lang4"
+                         , variable.name = "Dimension", value.name = "Value")
+
+# Plot heatmap
+ggplot(centroids_long, aes(x = Dimension, y = lang4, fill = Value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white"
+                       , high = "red", midpoint = 0) +
+  theme_minimal() +
+  labs(, x = "Dimension", y = "Language Class", fill = "Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Simple Autoencoder
+
+```{r}
+# Read Autoencoder embeddings
+SAE_mapping <- read.csv("encodings_AE_simple.csv")
+
+# Join metadata
+SAE_mapping <- left_join(SAE_mapping, unique(select(data, fileID, lang4))
+                        , by = "fileID")
+
+# Rename columns for consistency
+colnames(SAE_mapping)[colnames(SAE_mapping) 
+                     %in% c("X0", "X1")] <- c("Dim1", "Dim2")
+
+# Compute distance and heterogeneity, plot centroids
+SAE_distance <- compute_distance_matrix(SAE_mapping)
+SAE_heterogeneity <- compute_group_heterogeneity(SAE_mapping)
+plot_group_centroids(SAE_mapping)
+SAE_distance
+SAE_heterogeneity
+```
+
+## Simple Generalized Autoencoder
+
+
+```{r}
+# Read Autoencoder embeddings
+SGAE_mapping <- read.csv("encodings_MFA_simple.csv")
+
+# Join metadata
+SGAE_mapping <- left_join(SGAE_mapping, unique(select(data, fileID, lang4)),
+                         by = "fileID")
+
+# Rename columns for consistency
+colnames(SGAE_mapping)[colnames(SGAE_mapping) 
+                      %in% c("X0", "X1")] <- c("Dim1", "Dim2")
+
+# Compute distance and heterogeneity, plot centroids
+SGAE_distance <- compute_distance_matrix(SGAE_mapping)
+SGAE_heterogeneity <- compute_group_heterogeneity(SGAE_mapping)
+plot_group_centroids(SGAE_mapping)
+SGAE_distance
+SGAE_heterogeneity
+
+```
+
+## Advanced Autoencoder
+
+```{r}
+# Read Autoencoder embeddings
+AAE_mapping <- read.csv("encodings_AE_advanced.csv")
+
+# Join metadata
+AAE_mapping <- left_join(AAE_mapping, unique(select(data, fileID, lang4))
+                        , by = "fileID")
+
+# Rename columns for consistency
+colnames(AAE_mapping)[colnames(AAE_mapping) 
+                     %in% c("X0", "X1")] <- c("Dim1", "Dim2")
+
+# Compute distance and heterogeneity, plot centroids
+AAE_distance <- compute_distance_matrix(AAE_mapping)
+AAE_heterogeneity <- compute_group_heterogeneity(AAE_mapping)
+plot_group_centroids(AAE_mapping)
+AAE_distance
+AAE_heterogeneity
+
+# Subgroup
+SUBGROUP_map <- AAE_mapping['Dim1'] < -0.5
+#names(SUBGROUP_map) <- colnames(AAE_mapping)
+
+#plot_grouped(AAE_mapping, SUBGROUP_map)
+```
+
+
+## Advanced Generalized Autoencoder
+
+```{r}
+# Read Autoencoder embeddings
+AGAE_mapping <- read.csv("encodings_MFA_advanced.csv")
+
+# Join metadata
+AGAE_mapping <- left_join(AGAE_mapping, unique(select(data, fileID, lang4)),
+                         by = "fileID")
+
+# Rename columns for consistency
+colnames(AGAE_mapping)[colnames(AGAE_mapping) 
+                      %in% c("X0", "X1")] <- c("Dim1", "Dim2")
+
+# Compute distance and heterogeneity, plot centroids
+AGAE_distance <- compute_distance_matrix(AGAE_mapping)
+AGAE_heterogeneity <- compute_group_heterogeneity(AGAE_mapping)
+plot_group_centroids(AGAE_mapping)
+AGAE_distance
+AGAE_heterogeneity
+
+```
+
+## Distances between centers
+```{r}
+ALL_mapping <- list(
+  'DiCA' = DICA_mapping,
+  'MDS_CS' = MDS_CS_mapping,
+  'MDS_M' = MDS_M_mapping,
+  'Isomap_CS' = ISOMAP_CS_mapping,
+  'Isomap_M' = ISOMAP_M_mapping,
+  'LLE' = LLE_mapping,
+  'NMF' = NMF_mapping,
+  'SAE' = SAE_mapping,
+  'SGAE' = SGAE_mapping,
+  'AAE' = AAE_mapping,
+  'AGAE' = AGAE_mapping,
+  'DATA' = tot_df
+)
+
+```
+
+
+``` {r, fig.width = 15, fig.height = 5}
+ALL_distance <- list(
+  'DiCA' = DICA_distance,
+  'MDS_CS' = MDS_CS_distance,
+  'MDS_M'= MDS_M_distance,
+  'Isomap_CS' = ISOMAP_CS_distance,
+  'Isomap_M' = ISOMAP_M_distance,
+  'LLE' = LLE_distance,
+  'NMF' = NMF_distance,
+  'SAE' = SAE_distance,
+  'SGAE' = SGAE_distance,
+  'AAE' = AAE_distance,
+  'AGAE' = AGAE_distance,
+  'DATA' = DATA_distance
+)
+
+get_upper_triangle <- function(mat) {
+  mat[upper.tri(mat)]
+  }
+  
+distance_vectors <- lapply(ALL_distance, get_upper_triangle)
+get_correlation_plot(distance_vectors)
+
+```
+
+
+
+## Heterogeneity within groups
+``` {r, fig.width = 15, fig.height = 5}
+ALL_heterogeneity <- list(
+  'DiCA' = DICA_heterogeneity$heterogeneity_ratio,
+  'MDS_CS' = MDS_CS_heterogeneity$heterogeneity_ratio,
+  'MDS_M' = MDS_M_heterogeneity$heterogeneity_ratio,
+  'Isomap_CS' = ISOMAP_CS_heterogeneity$heterogeneity_ratio,
+  'Isomap_M' = ISOMAP_M_heterogeneity$heterogeneity_ratio,
+  'LLE' = LLE_heterogeneity$heterogeneity_ratio,
+  'NMF' = NMF_heterogeneity$heterogeneity_ratio,
+  'SAE' = SAE_heterogeneity$heterogeneity_ratio,
+  'SGAE' = SGAE_heterogeneity$heterogeneity_ratio,
+  'AAE' = AAE_heterogeneity$heterogeneity_ratio,
+  'AGAE' = AGAE_heterogeneity$heterogeneity_ratio,
+  'DATA' = DATA_heterogeneity$heterogeneity_ratio
+)
+
+get_correlation_plot(ALL_heterogeneity)
+```
+
+``` {r}
+
+# Convert to matrix
+ALL_heterogeneity_matrix <- do.call(cbind, ALL_heterogeneity)
+rownames(ALL_heterogeneity_matrix) <- levels_l4
+
+# Plot the heatmap
+pheatmap(ALL_heterogeneity_matrix,  
+         cluster_rows = FALSE,  # Keep row order
+         cluster_cols = FALSE,  # No clustering of methods
+         na_col = "grey",       # Grey for missing values
+         legend = TRUE,         # Show legend
+         display_numbers = TRUE
+        )
+
+print(ALL_heterogeneity_matrix)
+
+```
+
+### BOOTSTRAPPED CI, TAKES A LONG TIME, MAY NOT BE ACCURATE
+
+```{reval = FALSE}
+corr_res_dist <- compute_bootstrap_correlation_ci(ALL_mapping, 1000, 0.95,
+                                                  "distance")
+```
+
+``` {r, fig.width = 10, fig.height = 7, eval = FALSE}
+plot_cor_CI(corr_res_dist)
+```
+
+
+```{r, eval = FALSE}
+corr_res_hetero <- compute_bootstrap_correlation_ci(ALL_mapping, 1000, 0.95,
+                                                    "heterogeneity")
+```
+
+``` {r, fig.width = 10, fig.height = 7, eval = FALSE}
+plot_cor_CI(corr_res_hetero)
+```

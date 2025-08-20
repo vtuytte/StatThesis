@@ -5,7 +5,7 @@ This repository contains the code and data used for my thesis: *N-grams as chara
 ## Main Files
 - **`thesis.Rmd`** – RMarkdown file containing all analyses and plots presented in the thesis (excluding autoencoder training).  
 - **`Thesis.Rproj`** – R project file to manage the RMarkdown workflow.  
-- **`Training_autoencoder.ipynb`** – Jupyter notebook used to train the autoencoders.  
+- **`Training_autoencoder.ipynb`** – Jupyter notebook used to train the autoencoders and generate the autoencoder encodings.  
 - **Encodings (already generated):**  
   - `encodings_AE_simple.csv`  
   - `encodings_AE_advanced.csv`  

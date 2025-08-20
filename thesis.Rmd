@@ -25,6 +25,7 @@ library(grid)
 library(FactoMineR)
 library(proxy)
 library(ggrepel)
+library(openxlsx)
 ```
 
 ## Load Data
@@ -36,6 +37,9 @@ subset_data <- select(data, fileID, nN_GRM)
 lang4_map <- unique(select(data, fileID, lang4)) 
 levels_l4 <- levels(data$lang4)
 freq_table <- table(subset_data)
+rownames(freq_table) <- iconv(rownames(freq_table), to = "ASCII//TRANSLIT")
+colnames(freq_table) <- iconv(colnames(freq_table), to = "ASCII//TRANSLIT")
+write.csv2(as.matrix(freq_table), "freq_table.csv", row.names = TRUE)
 ```
 ## Helper functions
 
